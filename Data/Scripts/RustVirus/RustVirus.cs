@@ -23,7 +23,7 @@ namespace Rustvirus
         private readonly Random _random = new Random();
 
         // ===== TUNABLES =====
-        private const bool DEBUG_MODE = true;
+        private const bool DEBUG_MODE = false;
 
         private const int UPDATE_RATE = 60;                 // process raze queue every 60 ticks (~1s)
         private const int BLOCKS_TO_RAZE_PER_FRAME = 20;   // batch raze to reduce physics spikes
@@ -285,7 +285,7 @@ namespace Rustvirus
             }
 
             var functionalBlocks = new List<IMySlimBlock>();
-            grid.GetBlocks(functionalBlocks, b => b != null && b.FatBlock != null && !IsExcludedBlock(b));
+            grid.GetBlocks(functionalBlocks, b => b != null && IsValuableBlock(b));
 
             if (functionalBlocks.Count > 0)
             {
@@ -414,71 +414,65 @@ namespace Rustvirus
             RegisterSplitTrackingForRaze(grid);
             DisableAllPower(grid);
 
-            var blocks = new List<IMySlimBlock>();
-            grid.GetBlocks(blocks, block => block != null && block.FatBlock != null && !IsExcludedBlock(block));
+            // Only collect blocks with ScrapConstructionFrame — blocks players cannot build.
+            // Everything else (decorative, structural, lights, doors, pillars etc.) is left untouched.
+            var valuableBlocks = new List<IMySlimBlock>();
+            grid.GetBlocks(valuableBlocks, b => b != null && IsValuableBlock(b));
 
-            if (blocks.Count == 0)
+            var unmarkedValuable = valuableBlocks.Where(b =>
             {
-                if (DEBUG_MODE) Log($"[INFO] Armor-only grid, ignore forever: {grid.DisplayName}");
-                UnregisterSplitTracking(grid);
-                return QueueResult.IgnoreForever;
-            }
-
-            var valuableBlocks = blocks.Where(b =>
-            {
-                if (!IsValuableBlock(b))
-                    return false;
-
                 var tb = b.FatBlock as IMyTerminalBlock;
                 if (tb != null && IsMarkedTerminal(tb))
                 {
                     if (DEBUG_MODE) Log($"[DEBUG] Valuable block already marked, skipping: {Subtype(b)}");
                     return false;
                 }
-
                 return true;
             }).ToList();
 
             if (DEBUG_MODE)
-                Log($"[DEBUG] {grid.DisplayName}: functional={blocks.Count} valuableUnmarked={valuableBlocks.Count}");
+                Log($"[DEBUG] {grid.DisplayName}: valuable={valuableBlocks.Count} unmarked={unmarkedValuable.Count}");
+
+            if (unmarkedValuable.Count == 0)
+            {
+                if (DEBUG_MODE) Log($"[INFO] No valuable blocks found, ignore forever: {grid.DisplayName}");
+                UnregisterSplitTracking(grid);
+                return QueueResult.IgnoreForever;
+            }
 
             int keepCount = grid.GridSizeEnum == MyCubeSize.Small
-                ? Math.Min(10, valuableBlocks.Count)
-                : Math.Min(5, valuableBlocks.Count);
+                ? Math.Min(10, unmarkedValuable.Count)
+                : Math.Min(5, unmarkedValuable.Count);
 
             var kept = new HashSet<IMySlimBlock>();
 
-            if (valuableBlocks.Count > 0)
+            var powerBlocks = unmarkedValuable.Where(b => b.FatBlock is IMyPowerProducer).ToList();
+            if (powerBlocks.Count > 0)
             {
-                var powerBlocks = valuableBlocks.Where(b => b.FatBlock is IMyPowerProducer).ToList();
-                if (powerBlocks.Count > 0)
-                {
-                    var powerBlock = powerBlocks[_random.Next(powerBlocks.Count)];
-                    kept.Add(powerBlock);
-                    if (DEBUG_MODE) Log($"[DEBUG] Priority power keep: {Subtype(powerBlock)}");
-                }
+                var powerBlock = powerBlocks[_random.Next(powerBlocks.Count)];
+                kept.Add(powerBlock);
+                if (DEBUG_MODE) Log($"[DEBUG] Priority power keep: {Subtype(powerBlock)}");
+            }
 
-                int remaining = keepCount - kept.Count;
-                if (remaining > 0)
-                {
-                    var pool = valuableBlocks.Where(b => !kept.Contains(b)).OrderBy(_ => _random.Next()).Take(remaining);
-                    foreach (var b in pool)
-                        kept.Add(b);
-                }
+            int remaining = keepCount - kept.Count;
+            if (remaining > 0)
+            {
+                var pool = unmarkedValuable.Where(b => !kept.Contains(b)).OrderBy(_ => _random.Next()).Take(remaining);
+                foreach (var b in pool)
+                    kept.Add(b);
+            }
 
-                foreach (var b in kept)
-                {
-                    DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
-
-                    var tb = b.FatBlock as IMyTerminalBlock;
-                    if (tb != null)
-                        MarkTerminal(tb);
-                }
+            foreach (var b in kept)
+            {
+                DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
+                var tb = b.FatBlock as IMyTerminalBlock;
+                if (tb != null)
+                    MarkTerminal(tb);
             }
 
             var raze = new List<IMySlimBlock>();
 
-            foreach (var b in blocks)
+            foreach (var b in unmarkedValuable)
             {
                 if (kept.Contains(b))
                     continue;
@@ -508,6 +502,17 @@ namespace Rustvirus
                         DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
                         if (tb != null) MarkTerminal(tb);
                         if (DEBUG_MODE) Log($"[DEBUG] Kept Programmable Block (50%): {Subtype(b)}");
+                        continue;
+                    }
+                }
+
+                if (b.FatBlock is IMyJumpDrive)
+                {
+                    if (_random.NextDouble() < 0.25)
+                    {
+                        DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
+                        if (tb != null) MarkTerminal(tb);
+                        if (DEBUG_MODE) Log($"[DEBUG] Kept Jump Drive (25%): {Subtype(b)}");
                         continue;
                     }
                 }
@@ -583,8 +588,6 @@ namespace Rustvirus
 
                         try
                         {
-							if (DEBUG_MODE)
-							Log($"[DEBUG] Razing: {Subtype(b)}");
                             cg.RazeBlock(b.Position);
                             razed++;
                         }
@@ -795,45 +798,6 @@ namespace Rustvirus
             }
 
             return false;
-        }
-
-        private bool IsExcludedBlock(IMySlimBlock block)
-        {
-            if (block == null || block.BlockDefinition == null)
-                return true;
-
-            if (block.FatBlock != null)
-            {
-                var tb = block.FatBlock as IMyTerminalBlock;
-                if (tb != null)
-                {
-                    string n = tb.CustomName ?? "";
-                    if (n.Contains("Special Content") || n.Contains("DeleteThisBlock"))
-                        return true;
-                }
-            }
-
-            string subtype = block.BlockDefinition.Id.SubtypeName ?? "";
-
-            return subtype.Contains("Armor") ||
-                   subtype.Contains("Wheel") ||
-                   subtype.Contains("Suspension") ||
-                   subtype.Contains("Mag") ||
-                   subtype.Contains("Landing") ||
-                   subtype.Contains("Catwalk") ||
-                   subtype.Contains("Attach") ||
-                   subtype.Contains("Piston") ||
-                   subtype.Contains("Rotor") ||
-                   subtype.Contains("Hinge") ||
-                   subtype.Contains("Conveyor") ||
-                   subtype.Contains("StorageShelf") ||
-                   subtype.Contains("Barrel") ||
-                   subtype.Contains("Ladder") ||
-                   subtype.Contains("Ramp") ||
-                   subtype.Contains("Stair") ||
-                   subtype.Contains("Window") ||
-                   subtype.Contains("pipe") ||
-                   subtype.Contains("Freight");
         }
 
         private bool IsExcludedSpecialGrid(IMyCubeGrid grid)
