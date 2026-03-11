@@ -23,14 +23,22 @@ namespace Rustvirus
         private readonly Random _random = new Random();
 
         // ===== TUNABLES =====
-        private const bool DEBUG_MODE = true;
+        private const bool DEBUG_MODE = false;
 
         private const int UPDATE_RATE = 60;                 // process raze queue every 60 ticks (~1s)
-        private const int BLOCKS_TO_RAZE_PER_FRAME = 20;     // batch raze to reduce physics spikes
+        private const int BLOCKS_TO_RAZE_PER_FRAME = 20;   // batch raze to reduce physics spikes
 
-        private const int SPAWN_DELAY_SECONDS = 5;           // per-grid delay to let spawners finish setup
-        private const int STARTUP_GRACE_SECONDS = 60;        // global delay after world start (restart safety)
-        private const int NOT_READY_RETRY_SECONDS = 5;       // if grid not ready (physics/group), re-check later
+        private const int SPAWN_DELAY_SECONDS = 10;         // per-grid delay to let spawners finish setup
+        private const int STARTUP_GRACE_SECONDS = 60;       // global delay after world start (restart safety)
+        private const int NOT_READY_RETRY_SECONDS = 5;      // if grid not ready (physics/group), re-check later
+
+        // Pure armor debris chunks at or below this block count get deleted immediately on split.
+        // Anything larger is kept for immersion — it's still recognizable as part of the ship.
+        private const int MAX_DEBRIS_BLOCKS_TO_DELETE = 60;
+
+        // How long we monitor surviving split halves for further cascading splits.
+        // After this window, physics has done its worst and we stop watching.
+        private const int SPLIT_TRACKING_EXPIRY_SECONDS = 60;
 
         // ===== PERSISTENT MARKER (ModStorage) =====
         // One static GUID for the mod. Do NOT change once deployed, unless you intentionally want to forget old marks.
@@ -41,10 +49,10 @@ namespace Rustvirus
         private bool _simStarted = false;
         private DateTime _worldStartUtc;
 
-        // Pending grids to evaluate after delays/grace
+        // ===== SPLIT TRACKING =====
+        private readonly HashSet<long> _splitTrackedGridIds = new HashSet<long>();
+        private readonly Dictionary<long, DateTime> _splitTrackingExpiry = new Dictionary<long, DateTime>();
         private readonly Dictionary<long, DateTime> _processAfterUtcByGridId = new Dictionary<long, DateTime>();
-
-        // Work queue for razing
         private readonly Dictionary<long, GridProcessingState> _processingQueue = new Dictionary<long, GridProcessingState>();
 
         private int _updateCounter = 0;
@@ -52,21 +60,19 @@ namespace Rustvirus
         private class GridProcessingState
         {
             public IMyCubeGrid Grid;
-
-            public HashSet<IMySlimBlock> BlocksToKeep;   // actual block references
-            public List<IMySlimBlock> BlocksToRaze;      // actual block references
-
+            public HashSet<IMySlimBlock> BlocksToKeep;
+            public List<IMySlimBlock> BlocksToRaze;
             public int CurrentRazeIndex;
         }
 
-		private enum QueueResult
-		{
-			Queued,          // added to _processingQueue
-			IgnoreForever,   // armor-only / no functional blocks; mark grid and stop tracking
-			RetryLater       // not ready / nothing to do yet; try again later
-		}
+        private enum QueueResult
+        {
+            Queued,
+            IgnoreForever,
+            RetryLater
+        }
 
-
+        // ===== LIFECYCLE =====
 
         public override void LoadData()
         {
@@ -74,6 +80,7 @@ namespace Rustvirus
                 return;
 
             MyAPIGateway.Entities.OnEntityAdd += OnEntityAdded;
+            MyAPIGateway.Entities.OnEntityRemove += OnEntityRemoved;
         }
 
         protected override void UnloadData()
@@ -82,6 +89,7 @@ namespace Rustvirus
                 return;
 
             MyAPIGateway.Entities.OnEntityAdd -= OnEntityAdded;
+            MyAPIGateway.Entities.OnEntityRemove -= OnEntityRemoved;
         }
 
         public override void UpdateBeforeSimulation()
@@ -97,17 +105,15 @@ namespace Rustvirus
                 return;
             }
 
-            // Drain pending grids whose not-before time has elapsed,
-            // BUT only after startup grace.
             if (!InStartupGrace())
             {
                 EvaluatePendingGrids();
             }
 
-            // Process raze queue every UPDATE_RATE ticks
             if (++_updateCounter % UPDATE_RATE == 0)
             {
                 ProcessQueue();
+                ExpireSplitTracking();
             }
         }
 
@@ -116,21 +122,20 @@ namespace Rustvirus
             return (DateTime.UtcNow - _worldStartUtc).TotalSeconds < STARTUP_GRACE_SECONDS;
         }
 
+        // ===== ENTITY EVENTS =====
+
         private void OnEntityAdded(IMyEntity entity)
         {
             try
             {
-                // Do not try to classify/queue here; just schedule evaluation.
                 var grid = entity as IMyCubeGrid;
                 if (grid == null) return;
 
-                // Schedule evaluation for max(spawn+delay, worldStart+grace)
                 var now = DateTime.UtcNow;
                 var perGridReady = now.AddSeconds(SPAWN_DELAY_SECONDS);
                 var globalReady = _worldStartUtc.AddSeconds(STARTUP_GRACE_SECONDS);
                 var processAfter = perGridReady > globalReady ? perGridReady : globalReady;
 
-                // If we already have a later processAfter, keep the later.
                 DateTime existing;
                 if (_processAfterUtcByGridId.TryGetValue(grid.EntityId, out existing))
                 {
@@ -143,9 +148,7 @@ namespace Rustvirus
                 }
 
                 if (DEBUG_MODE)
-                {
                     Log($"[ADD] id={grid.EntityId} name=\"{grid.DisplayName}\" size={grid.GridSizeEnum} owners={grid.BigOwners?.Count ?? 0} processAfter={processAfter:O}");
-                }
             }
             catch (Exception ex)
             {
@@ -153,217 +156,387 @@ namespace Rustvirus
             }
         }
 
-private void EvaluatePendingGrids()
-{
-    if (_processAfterUtcByGridId.Count == 0)
-        return;
-
-    var now = DateTime.UtcNow;
-    var gridIds = _processAfterUtcByGridId.Keys.ToList();
-
-    foreach (var gridId in gridIds)
-    {
-        DateTime processAfter;
-        if (!_processAfterUtcByGridId.TryGetValue(gridId, out processAfter))
-            continue;
-
-        if (now < processAfter)
-            continue;
-
-        IMyEntity entity;
-        if (!MyAPIGateway.Entities.TryGetEntityById(gridId, out entity) || entity == null)
+        private void OnEntityRemoved(IMyEntity entity)
         {
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        var grid = entity as IMyCubeGrid;
-        if (grid == null || grid.Closed || grid.MarkedForClose)
-        {
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        if (grid.Physics == null)
-        {
-            _processAfterUtcByGridId[gridId] = now.AddSeconds(NOT_READY_RETRY_SECONDS);
-            if (DEBUG_MODE) Log($"[DEFER] id={gridId} name=\"{grid.DisplayName}\" reason=PhysicsNull retry={NOT_READY_RETRY_SECONDS}s");
-            continue;
-        }
-
-        if (IsExcludedSpecialGrid(grid))
-        {
-            if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=SpecialGrid");
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        if (IsPlayerOwnedMechanicalGroup(grid))
-        {
-            if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=PlayerMechanicalGroup");
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        if (IsFactorumMechanicalGroup(grid))
-        {
-            if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=FactorumMechanicalGroup");
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        if (IsMarkedEntity(entity))
-        {
-            if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=GridAlreadyMarked");
-            _processAfterUtcByGridId.Remove(gridId);
-            continue;
-        }
-
-        Log($"[QUEUE] NPC/Nobody grid for salvage: id={gridId} name=\"{grid.DisplayName}\"");
-        var result = QueueGridForProcessing(grid);
-
-        if (result == QueueResult.Queued || result == QueueResult.IgnoreForever)
-        {
-            // Mark to prevent repeated evaluation churn (detach/splits/armor-only debris)
-            MarkEntity(entity);
-            _processAfterUtcByGridId.Remove(gridId);
-        }
-        else // RetryLater
-        {
-            _processAfterUtcByGridId[gridId] = now.AddSeconds(NOT_READY_RETRY_SECONDS);
-            if (DEBUG_MODE) Log($"[DEFER] id={gridId} name=\"{grid.DisplayName}\" reason=RetryLater retry={NOT_READY_RETRY_SECONDS}s");
-        }
-    }
-}
-
-private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
-{
-    if (grid == null)
-        return QueueResult.RetryLater;
-
-    if (_processingQueue.ContainsKey(grid.EntityId))
-        return QueueResult.Queued;
-
-    // Disable power (wreck beacons etc can stay; power producers disabled)
-    DisableAllPower(grid);
-
-    // Collect all functional blocks (FatBlock != null) excluding your excluded subtypes
-    var blocks = new List<IMySlimBlock>();
-    grid.GetBlocks(blocks, block => block != null && block.FatBlock != null && !IsExcludedBlock(block));
-
-    if (blocks.Count == 0)
-    {
-        if (DEBUG_MODE) Log($"[INFO] Armor-only grid, ignore forever: {grid.DisplayName}");
-        return QueueResult.IgnoreForever;
-    }
-
-    // Valuable blocks that are NOT already marked (do not re-process)
-    var valuableBlocks = blocks.Where(b =>
-    {
-        if (!IsValuableBlock(b))
-            return false;
-
-        var tb = b.FatBlock as IMyTerminalBlock;
-        if (tb != null && IsMarkedTerminal(tb))
-        {
-            if (DEBUG_MODE) Log($"[DEBUG] Valuable block already marked, skipping: {Subtype(b)}");
-            return false;
-        }
-
-        return true;
-    }).ToList();
-
-    if (DEBUG_MODE)
-        Log($"[DEBUG] {grid.DisplayName}: functional={blocks.Count} valuableUnmarked={valuableBlocks.Count}");
-
-    // Choose kept blocks
-    int keepCount = grid.GridSizeEnum == MyCubeSize.Small
-        ? Math.Min(10, valuableBlocks.Count)
-        : Math.Min(5, valuableBlocks.Count);
-
-    var kept = new HashSet<IMySlimBlock>();
-
-    if (valuableBlocks.Count > 0)
-    {
-        // Ensure at least one power source is kept if possible
-        var powerBlocks = valuableBlocks.Where(b => b.FatBlock is IMyPowerProducer).ToList();
-        if (powerBlocks.Count > 0)
-        {
-            var powerBlock = powerBlocks[_random.Next(powerBlocks.Count)];
-            kept.Add(powerBlock);
-            if (DEBUG_MODE) Log($"[DEBUG] Priority power keep: {Subtype(powerBlock)}");
-        }
-
-        // Fill remaining slots randomly
-        int remaining = keepCount - kept.Count;
-        if (remaining > 0)
-        {
-            var pool = valuableBlocks.Where(b => !kept.Contains(b)).OrderBy(_ => _random.Next()).Take(remaining);
-            foreach (var b in pool)
-                kept.Add(b);
-        }
-
-        // Damage kept blocks to 20–70% integrity and mark their terminal blocks
-        foreach (var b in kept)
-        {
-            DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
-
-            var tb = b.FatBlock as IMyTerminalBlock;
-            if (tb != null)
-                MarkTerminal(tb);
-        }
-    }
-
-    // Build raze list:
-    // - never raze marked terminal blocks
-    // - small-grid O2/H2 generator 50% chance keep+damage+mark
-    var raze = new List<IMySlimBlock>();
-
-    foreach (var b in blocks)
-    {
-        if (kept.Contains(b))
-            continue;
-
-        var tb = b.FatBlock as IMyTerminalBlock;
-        if (tb != null && IsMarkedTerminal(tb))
-        {
-            if (DEBUG_MODE) Log($"[DEBUG] Not razing (marked): {Subtype(b)}");
-            continue;
-        }
-
-        if (grid.GridSizeEnum == MyCubeSize.Small && b.FatBlock is IMyGasGenerator)
-        {
-            if (_random.NextDouble() < 0.5)
+            try
             {
-                DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
-                if (tb != null) MarkTerminal(tb);
-                if (DEBUG_MODE) Log($"[DEBUG] Kept O2/H2 Gen (50%): {Subtype(b)}");
-                continue;
+                var grid = entity as IMyCubeGrid;
+                if (grid == null) return;
+
+                if (_splitTrackedGridIds.Contains(grid.EntityId))
+                {
+                    grid.OnGridSplit -= OnGridSplit;
+                    _splitTrackedGridIds.Remove(grid.EntityId);
+                    _splitTrackingExpiry.Remove(grid.EntityId);
+
+                    if (DEBUG_MODE)
+                        Log($"[SPLIT] Unregistered split handler (entity removed): id={grid.EntityId} name=\"{grid.DisplayName}\"");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in OnEntityRemoved: {ex}");
             }
         }
 
-        raze.Add(b);
-    }
+        // ===== SPLIT TRACKING =====
 
-    if (raze.Count == 0)
-    {
-        if (DEBUG_MODE) Log($"[INFO] Nothing to raze on {grid.DisplayName}");
-        return QueueResult.RetryLater;
-    }
+        private void RegisterSplitTrackingForRaze(IMyCubeGrid grid)
+        {
+            if (grid == null) return;
+            if (_splitTrackedGridIds.Contains(grid.EntityId)) return;
 
-    _processingQueue[grid.EntityId] = new GridProcessingState
-    {
-        Grid = grid,
-        BlocksToKeep = kept,
-        BlocksToRaze = raze,
-        CurrentRazeIndex = 0
-    };
+            grid.OnGridSplit += OnGridSplit;
+            _splitTrackedGridIds.Add(grid.EntityId);
 
-    if (DEBUG_MODE)
-        Log($"[DEBUG] Queued {grid.DisplayName}: raze={raze.Count} keep={kept.Count}");
+            if (DEBUG_MODE)
+                Log($"[SPLIT] Registered split handler (raze): id={grid.EntityId} name=\"{grid.DisplayName}\"");
+        }
 
-    return QueueResult.Queued;
-}
+        private void RegisterSplitTrackingForSurvivingHalf(IMyCubeGrid grid)
+        {
+            if (grid == null) return;
+
+            if (!_splitTrackedGridIds.Contains(grid.EntityId))
+            {
+                grid.OnGridSplit += OnGridSplit;
+                _splitTrackedGridIds.Add(grid.EntityId);
+            }
+
+            _splitTrackingExpiry[grid.EntityId] = DateTime.UtcNow.AddSeconds(SPLIT_TRACKING_EXPIRY_SECONDS);
+
+            if (DEBUG_MODE)
+                Log($"[SPLIT] Registered split handler (surviving half, expires {SPLIT_TRACKING_EXPIRY_SECONDS}s): id={grid.EntityId} name=\"{grid.DisplayName}\"");
+        }
+
+        private void UnregisterSplitTracking(IMyCubeGrid grid)
+        {
+            if (grid == null) return;
+            if (!_splitTrackedGridIds.Contains(grid.EntityId)) return;
+
+            grid.OnGridSplit -= OnGridSplit;
+            _splitTrackedGridIds.Remove(grid.EntityId);
+            _splitTrackingExpiry.Remove(grid.EntityId);
+
+            if (DEBUG_MODE)
+                Log($"[SPLIT] Unregistered split handler: id={grid.EntityId} name=\"{grid.DisplayName}\"");
+        }
+
+        private void ExpireSplitTracking()
+        {
+            if (_splitTrackingExpiry.Count == 0)
+                return;
+
+            var now = DateTime.UtcNow;
+            var expired = _splitTrackingExpiry.Where(kvp => now >= kvp.Value).Select(kvp => kvp.Key).ToList();
+
+            foreach (var gridId in expired)
+            {
+                _splitTrackingExpiry.Remove(gridId);
+                _splitTrackedGridIds.Remove(gridId);
+
+                IMyEntity entity;
+                if (MyAPIGateway.Entities.TryGetEntityById(gridId, out entity))
+                {
+                    var grid = entity as IMyCubeGrid;
+                    if (grid != null)
+                    {
+                        grid.OnGridSplit -= OnGridSplit;
+                        if (DEBUG_MODE)
+                            Log($"[SPLIT] Expired split tracking: id={gridId} name=\"{grid.DisplayName}\"");
+                    }
+                }
+                else
+                {
+                    if (DEBUG_MODE)
+                        Log($"[SPLIT] Expired split tracking (grid already gone): id={gridId}");
+                }
+            }
+        }
+
+        private void OnGridSplit(IMyCubeGrid originalGrid, IMyCubeGrid newGrid)
+        {
+            try
+            {
+                if (!MyAPIGateway.Multiplayer.IsServer) return;
+
+                if (DEBUG_MODE)
+                    Log($"[SPLIT] Detected: original=\"{originalGrid?.DisplayName}\" new=\"{newGrid?.DisplayName}\"");
+
+                TryDeleteDebrisGrid(originalGrid, "original");
+                TryDeleteDebrisGrid(newGrid, "new");
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in OnGridSplit: {ex}");
+            }
+        }
+
+        private void TryDeleteDebrisGrid(IMyCubeGrid grid, string label)
+        {
+            if (grid == null || grid.Closed || grid.MarkedForClose)
+                return;
+
+            if (IsPlayerOwnedMechanicalGroup(grid))
+            {
+                if (DEBUG_MODE)
+                    Log($"[SPLIT] {label} half is player-owned, skipping: \"{grid.DisplayName}\"");
+                return;
+            }
+
+            var functionalBlocks = new List<IMySlimBlock>();
+            grid.GetBlocks(functionalBlocks, b => b != null && b.FatBlock != null && !IsExcludedBlock(b));
+
+            if (functionalBlocks.Count > 0)
+            {
+                RegisterSplitTrackingForSurvivingHalf(grid);
+                if (DEBUG_MODE)
+                    Log($"[SPLIT] {label} half has {functionalBlocks.Count} functional blocks, registering for further splits: \"{grid.DisplayName}\"");
+                return;
+            }
+
+            var allBlocks = new List<IMySlimBlock>();
+            grid.GetBlocks(allBlocks);
+
+            if (allBlocks.Count > MAX_DEBRIS_BLOCKS_TO_DELETE)
+            {
+                RegisterSplitTrackingForSurvivingHalf(grid);
+                if (DEBUG_MODE)
+                    Log($"[SPLIT] {label} half is pure armor but {allBlocks.Count} blocks > {MAX_DEBRIS_BLOCKS_TO_DELETE}, keeping for immersion: \"{grid.DisplayName}\"");
+                return;
+            }
+
+            if (DEBUG_MODE)
+                Log($"[SPLIT] {label} half is pure armor debris ({allBlocks.Count} blocks), deleting: \"{grid.DisplayName}\"");
+
+            try
+            {
+                grid.Close();
+            }
+            catch (Exception ex)
+            {
+                Log($"[SPLIT] Failed to close debris grid \"{grid.DisplayName}\": {ex.Message}");
+            }
+        }
+
+        // ===== EVALUATE / QUEUE =====
+
+        private void EvaluatePendingGrids()
+        {
+            if (_processAfterUtcByGridId.Count == 0)
+                return;
+
+            var now = DateTime.UtcNow;
+            var gridIds = _processAfterUtcByGridId.Keys.ToList();
+
+            foreach (var gridId in gridIds)
+            {
+                DateTime processAfter;
+                if (!_processAfterUtcByGridId.TryGetValue(gridId, out processAfter))
+                    continue;
+
+                if (now < processAfter)
+                    continue;
+
+                IMyEntity entity;
+                if (!MyAPIGateway.Entities.TryGetEntityById(gridId, out entity) || entity == null)
+                {
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                var grid = entity as IMyCubeGrid;
+                if (grid == null || grid.Closed || grid.MarkedForClose)
+                {
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                if (grid.Physics == null)
+                {
+                    _processAfterUtcByGridId[gridId] = now.AddSeconds(NOT_READY_RETRY_SECONDS);
+                    if (DEBUG_MODE) Log($"[DEFER] id={gridId} name=\"{grid.DisplayName}\" reason=PhysicsNull retry={NOT_READY_RETRY_SECONDS}s");
+                    continue;
+                }
+
+                if (IsExcludedSpecialGrid(grid))
+                {
+                    if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=SpecialGrid");
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                if (IsPlayerOwnedMechanicalGroup(grid))
+                {
+                    if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=PlayerMechanicalGroup");
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                if (IsFactorumMechanicalGroup(grid))
+                {
+                    if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=FactorumMechanicalGroup");
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                if (IsMarkedEntity(entity))
+                {
+                    if (DEBUG_MODE) Log($"[SKIP] id={gridId} name=\"{grid.DisplayName}\" reason=GridAlreadyMarked");
+                    _processAfterUtcByGridId.Remove(gridId);
+                    continue;
+                }
+
+                Log($"[QUEUE] NPC/Nobody grid for salvage: id={gridId} name=\"{grid.DisplayName}\"");
+                var result = QueueGridForProcessing(grid);
+
+                if (result == QueueResult.Queued || result == QueueResult.IgnoreForever)
+                {
+                    MarkEntity(entity);
+                    _processAfterUtcByGridId.Remove(gridId);
+                }
+                else
+                {
+                    _processAfterUtcByGridId[gridId] = now.AddSeconds(NOT_READY_RETRY_SECONDS);
+                    if (DEBUG_MODE) Log($"[DEFER] id={gridId} name=\"{grid.DisplayName}\" reason=RetryLater retry={NOT_READY_RETRY_SECONDS}s");
+                }
+            }
+        }
+
+        private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
+        {
+            if (grid == null)
+                return QueueResult.RetryLater;
+
+            if (_processingQueue.ContainsKey(grid.EntityId))
+                return QueueResult.Queued;
+
+            RegisterSplitTrackingForRaze(grid);
+            DisableAllPower(grid);
+
+            var blocks = new List<IMySlimBlock>();
+            grid.GetBlocks(blocks, block => block != null && block.FatBlock != null && !IsExcludedBlock(block));
+
+            if (blocks.Count == 0)
+            {
+                if (DEBUG_MODE) Log($"[INFO] Armor-only grid, ignore forever: {grid.DisplayName}");
+                UnregisterSplitTracking(grid);
+                return QueueResult.IgnoreForever;
+            }
+
+            var valuableBlocks = blocks.Where(b =>
+            {
+                if (!IsValuableBlock(b))
+                    return false;
+
+                var tb = b.FatBlock as IMyTerminalBlock;
+                if (tb != null && IsMarkedTerminal(tb))
+                {
+                    if (DEBUG_MODE) Log($"[DEBUG] Valuable block already marked, skipping: {Subtype(b)}");
+                    return false;
+                }
+
+                return true;
+            }).ToList();
+
+            if (DEBUG_MODE)
+                Log($"[DEBUG] {grid.DisplayName}: functional={blocks.Count} valuableUnmarked={valuableBlocks.Count}");
+
+            int keepCount = grid.GridSizeEnum == MyCubeSize.Small
+                ? Math.Min(10, valuableBlocks.Count)
+                : Math.Min(5, valuableBlocks.Count);
+
+            var kept = new HashSet<IMySlimBlock>();
+
+            if (valuableBlocks.Count > 0)
+            {
+                var powerBlocks = valuableBlocks.Where(b => b.FatBlock is IMyPowerProducer).ToList();
+                if (powerBlocks.Count > 0)
+                {
+                    var powerBlock = powerBlocks[_random.Next(powerBlocks.Count)];
+                    kept.Add(powerBlock);
+                    if (DEBUG_MODE) Log($"[DEBUG] Priority power keep: {Subtype(powerBlock)}");
+                }
+
+                int remaining = keepCount - kept.Count;
+                if (remaining > 0)
+                {
+                    var pool = valuableBlocks.Where(b => !kept.Contains(b)).OrderBy(_ => _random.Next()).Take(remaining);
+                    foreach (var b in pool)
+                        kept.Add(b);
+                }
+
+                foreach (var b in kept)
+                {
+                    DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
+
+                    var tb = b.FatBlock as IMyTerminalBlock;
+                    if (tb != null)
+                        MarkTerminal(tb);
+                }
+            }
+
+            var raze = new List<IMySlimBlock>();
+
+            foreach (var b in blocks)
+            {
+                if (kept.Contains(b))
+                    continue;
+
+                var tb = b.FatBlock as IMyTerminalBlock;
+                if (tb != null && IsMarkedTerminal(tb))
+                {
+                    if (DEBUG_MODE) Log($"[DEBUG] Not razing (marked): {Subtype(b)}");
+                    continue;
+                }
+
+                if (grid.GridSizeEnum == MyCubeSize.Small && b.FatBlock is IMyGasGenerator)
+                {
+                    if (_random.NextDouble() < 0.5)
+                    {
+                        DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
+                        if (tb != null) MarkTerminal(tb);
+                        if (DEBUG_MODE) Log($"[DEBUG] Kept O2/H2 Gen (50%): {Subtype(b)}");
+                        continue;
+                    }
+                }
+
+                if (b.FatBlock is IMyProgrammableBlock)
+                {
+                    if (_random.NextDouble() < 0.5)
+                    {
+                        DamageBlockToTargetIntegrity(b, 0.2f, 0.7f);
+                        if (tb != null) MarkTerminal(tb);
+                        if (DEBUG_MODE) Log($"[DEBUG] Kept Programmable Block (50%): {Subtype(b)}");
+                        continue;
+                    }
+                }
+
+                raze.Add(b);
+            }
+
+            if (raze.Count == 0)
+            {
+                if (DEBUG_MODE) Log($"[INFO] Nothing to raze on {grid.DisplayName}");
+                UnregisterSplitTracking(grid);
+                return QueueResult.IgnoreForever;
+            }
+
+            _processingQueue[grid.EntityId] = new GridProcessingState
+            {
+                Grid = grid,
+                BlocksToKeep = kept,
+                BlocksToRaze = raze,
+                CurrentRazeIndex = 0
+            };
+
+            if (DEBUG_MODE)
+                Log($"[DEBUG] Queued {grid.DisplayName}: raze={raze.Count} keep={kept.Count}");
+
+            return QueueResult.Queued;
+        }
+
+        // ===== PROCESS QUEUE =====
 
         private void ProcessQueue()
         {
@@ -381,6 +554,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
 
                     if (state.Grid == null || state.Grid.Closed || state.Grid.MarkedForClose)
                     {
+                        UnregisterSplitTracking(state.Grid);
                         SafeClearState(state);
                         gridsToRemove.Add(gridId);
                         continue;
@@ -400,9 +574,6 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
                         if (cg == null || cg.Closed || cg.MarkedForClose)
                             continue;
 
-                        // FINAL SAFETY NET:
-                        // Never raze anything belonging to a player-owned mechanical group,
-                        // even if it somehow got queued earlier.
                         if (IsPlayerOwnedMechanicalGroup(cg))
                         {
                             if (DEBUG_MODE)
@@ -427,11 +598,11 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
                         if (DEBUG_MODE)
                             Log($"[DONE] {state.Grid.DisplayName}: razed={state.BlocksToRaze.Count} kept={state.BlocksToKeep.Count}");
 
+                        UnregisterSplitTracking(state.Grid);
                         SafeClearState(state);
                         gridsToRemove.Add(gridId);
                     }
 
-                    // Only process one grid per update to spread load
                     break;
                 }
 
@@ -457,6 +628,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
         }
 
         // ===== DAMAGE =====
+
         private void DamageBlockToTargetIntegrity(IMySlimBlock block, float minTargetRatio, float maxTargetRatio)
         {
             if (block == null)
@@ -465,7 +637,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             float targetRatio = minTargetRatio + (float)_random.NextDouble() * (maxTargetRatio - minTargetRatio);
 
             float max = block.MaxIntegrity;
-            float cur = block.Integrity;  // correct measure for current integrity
+            float cur = block.Integrity;
             if (max <= 0f) return;
 
             float curRatio = cur / max;
@@ -476,7 +648,6 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             if (damageNeeded <= 0f)
                 return;
 
-            // Provide hitInfo with correct world position (not grid cell)
             var hitInfo = new MyHitInfo
             {
                 Position = block.CubeGrid.GridIntegerToWorld(block.Position),
@@ -498,6 +669,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
         }
 
         // ===== POWER =====
+
         private void DisableAllPower(IMyCubeGrid grid)
         {
             var blocks = new List<IMySlimBlock>();
@@ -512,6 +684,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
         }
 
         // ===== OWNERSHIP / GROUPING =====
+
         private bool IsPlayerOwnedMechanicalGroup(IMyCubeGrid grid)
         {
             try
@@ -534,7 +707,6 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             }
             catch
             {
-                // If the API fails for any reason, fall back to direct grid ownership check.
                 return IsPlayerOwnedGridByIdentity(grid);
             }
         }
@@ -588,25 +760,23 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             return false;
         }
 
-        // Critical: offline players must count. Using SteamId mapping avoids the “online only” bug.
         private bool IsRealPlayerIdentity(long identityId)
         {
             if (identityId == 0) return false;
 
             try
             {
-                // Returns 0 for NPC/no steam mapping in most SE builds.
                 ulong steamId = MyAPIGateway.Players.TryGetSteamId(identityId);
                 return steamId != 0;
             }
             catch
             {
-                // Fallback: if steam lookup isn't available, treat as non-player (safer for your NPC/Nobody policy).
                 return false;
             }
         }
 
         // ===== VALUE / EXCLUSIONS =====
+
         private bool IsValuableBlock(IMySlimBlock block)
         {
             if (block?.FatBlock == null || block.BlockDefinition == null)
@@ -616,7 +786,6 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             if (def?.Components == null)
                 return false;
 
-            // Valuable if it requires ScrapConstructionFrame
             foreach (var c in def.Components)
             {
                 if (c.Definition?.Id.SubtypeName == "ScrapConstructionFrame")
@@ -631,7 +800,6 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
             if (block == null || block.BlockDefinition == null)
                 return true;
 
-            // Unknown Signal special content blocks
             if (block.FatBlock != null)
             {
                 var tb = block.FatBlock as IMyTerminalBlock;
@@ -674,6 +842,9 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
 
             if (name.Contains("unknown signal") ||
                 name.Contains("strong signal") ||
+                name.Contains("large loot") ||
+                name.Contains("small loot") ||
+                name.Contains("[lb ") ||
                 name.Contains("unidentified signal"))
                 return true;
 
@@ -685,6 +856,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
         }
 
         // ===== MODSTORAGE MARKERS =====
+
         private bool IsMarkedTerminal(IMyTerminalBlock tb)
         {
             try
@@ -734,6 +906,7 @@ private QueueResult QueueGridForProcessing(IMyCubeGrid grid)
         }
 
         // ===== UTIL =====
+
         private string Subtype(IMySlimBlock b)
         {
             try
