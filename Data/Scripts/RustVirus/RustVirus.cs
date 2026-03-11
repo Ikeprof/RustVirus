@@ -23,7 +23,7 @@ namespace Rustvirus
         private readonly Random _random = new Random();
 
         // ===== TUNABLES =====
-        private const bool DEBUG_MODE = false;
+        private const bool DEBUG_MODE = true;
 
         private const int UPDATE_RATE = 60;                 // process raze queue every 60 ticks (~1s)
         private const int BLOCKS_TO_RAZE_PER_FRAME = 20;   // batch raze to reduce physics spikes
@@ -583,6 +583,8 @@ namespace Rustvirus
 
                         try
                         {
+							if (DEBUG_MODE)
+							Log($"[DEBUG] Razing: {Subtype(b)}");
                             cg.RazeBlock(b.Position);
                             razed++;
                         }
